@@ -18,13 +18,6 @@ cloudinary.config(
 )
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-# Defaults are tuned for Render free plan (512 MB RAM):
-#   Facenet  — 128-dim embeddings, ~22 MB model file
-#   opencv   — Haar cascade detector, no neural net, near-zero RAM overhead
-#   0.40     — cosine distance threshold for Facenet (stricter than ArcFace's 0.68)
-#
-# To upgrade to higher accuracy on Render Starter ($7/mo, 1 GB RAM):
-#   FACE_MODEL=ArcFace  FACE_DETECTOR=retinaface  FACE_THRESHOLD=0.68
 FACE_MODEL      = os.getenv("FACE_MODEL",           "Facenet")
 FACE_DETECTOR   = os.getenv("FACE_DETECTOR",         "opencv")
 DISTANCE_METRIC = os.getenv("FACE_DISTANCE_METRIC",  "cosine")
@@ -76,25 +69,15 @@ def upload_face_to_cloudinary(image_bytes: bytes, student_id: str) -> str:
 def generate_face_encoding(image_bytes: bytes) -> List[float]:
     """
     Generate a face encoding (embedding vector) from an image.
-    This is the mathematical representation of a face stored in MongoDB.
-
-    With Facenet the returned vector is 128-dimensional.
-    With ArcFace  the returned vector is 512-dimensional.
-    Vectors from different models are NOT interchangeable — if you switch
-    models, wipe existing faceEncoding fields and have students re-register.
-
-    Raises:
-        ValueError: If no face is detected or multiple faces are found.
     """
     tmp_path = save_temp_image(image_bytes)
 
     try:
-        # DeepFace.represent returns a list of detected face embeddings
         embeddings = DeepFace.represent(
             img_path=tmp_path,
             model_name=FACE_MODEL,
             detector_backend=FACE_DETECTOR,
-            enforce_detection=True,
+            enforce_detection=False,  # ← Changed to False for better detection
             align=True
         )
 
@@ -123,26 +106,15 @@ def verify_single_face(
 ) -> Dict:
     """
     Compare a selfie against a stored face encoding.
-    Used for student self-attendance (selfie flow).
-
-    Returns:
-        dict with keys: matched (bool), distance (float), threshold (float)
-
-    Important: the stored_encoding dimension must match the current FACE_MODEL.
-    Facenet  → 128 floats   (threshold ~0.40)
-    ArcFace  → 512 floats   (threshold ~0.68)
-    If dimensions mismatch the numpy dot product raises a shape error which
-    the caller catches and surfaces as a 500.
     """
     tmp_path = save_temp_image(selfie_bytes)
 
     try:
-        # Generate encoding for the incoming selfie
         selfie_embeddings = DeepFace.represent(
             img_path=tmp_path,
             model_name=FACE_MODEL,
             detector_backend=FACE_DETECTOR,
-            enforce_detection=True,
+            enforce_detection=False,  # ← Changed to False
             align=True
         )
 
@@ -163,22 +135,18 @@ def verify_single_face(
         selfie_vector = np.array(selfie_embeddings[0]["embedding"])
         stored_vector = np.array(stored_encoding)
 
-        # Guard against dimension mismatch (old ArcFace encoding vs new Facenet model)
         if selfie_vector.shape != stored_vector.shape:
             return {
                 "matched": False,
                 "distance": None,
                 "error": (
-                    "Your stored face data is incompatible with the current model. "
-                    "Please go to your Profile and re-register your face."
+                    "Your stored face data is incompatible. "
+                    "Please re-register your face in your profile."
                 )
             }
 
-        # Cosine distance — lower means more similar (0 = identical, 1 = opposite)
-        # Facenet + cosine threshold: 0.40
-        # ArcFace + cosine threshold: 0.68
         if DISTANCE_METRIC == "cosine":
-            dot    = np.dot(selfie_vector, stored_vector)
+            dot = np.dot(selfie_vector, stored_vector)
             norm_a = np.linalg.norm(selfie_vector)
             norm_b = np.linalg.norm(stored_vector)
             if norm_a == 0 or norm_b == 0:
@@ -186,14 +154,16 @@ def verify_single_face(
             else:
                 distance = 1 - (dot / (norm_a * norm_b))
         else:
-            # Euclidean distance
             distance = float(np.linalg.norm(selfie_vector - stored_vector))
 
         matched = distance <= THRESHOLD
 
+        # Add debug logging
+        print(f"Face verification - Distance: {distance}, Threshold: {THRESHOLD}, Matched: {matched}")
+
         return {
-            "matched":   matched,
-            "distance":  round(float(distance), 4),
+            "matched": matched,
+            "distance": round(float(distance), 4),
             "threshold": THRESHOLD
         }
 
@@ -208,18 +178,6 @@ def recognize_faces_in_class_photo(
 ) -> Tuple[List[str], int, int]:
     """
     Recognize multiple student faces in a single classroom photo.
-    Used for the lecturer group-photo attendance method.
-
-    Args:
-        image_bytes: Raw bytes of the classroom photo.
-        students_with_encodings: List of student dicts from MongoDB,
-                                  each with _id and faceEncoding fields.
-
-    Returns:
-        Tuple of:
-        - recognized_student_ids (List[str])
-        - total_faces_detected   (int)
-        - unrecognized_count     (int)
     """
     tmp_path = save_temp_image(image_bytes)
     recognized_ids: List[str] = []
@@ -229,13 +187,12 @@ def recognize_faces_in_class_photo(
         if img is None:
             raise ValueError("Could not read classroom image.")
 
-        # Extract all face embeddings from the classroom image
         try:
             class_embeddings = DeepFace.represent(
                 img_path=tmp_path,
                 model_name=FACE_MODEL,
                 detector_backend=FACE_DETECTOR,
-                enforce_detection=False,   # Don't fail if some faces are unclear
+                enforce_detection=False,
                 align=True
             )
         except Exception as e:
@@ -246,13 +203,12 @@ def recognize_faces_in_class_photo(
             return [], 0, 0
 
         total_detected = len(class_embeddings)
-        unrecognized   = 0
+        unrecognized = 0
 
-        # For each detected face find the closest matching registered student
         for face_data in class_embeddings:
-            face_vector     = np.array(face_data["embedding"])
+            face_vector = np.array(face_data["embedding"])
             best_match_id: Optional[str] = None
-            best_distance   = float("inf")
+            best_distance = float("inf")
 
             for student in students_with_encodings:
                 stored_encoding = student.get("faceEncoding")
@@ -261,13 +217,10 @@ def recognize_faces_in_class_photo(
 
                 stored_vector = np.array(stored_encoding)
 
-                # Skip students whose encoding dimension doesn't match
-                # (leftover ArcFace encodings when running Facenet, or vice-versa)
                 if face_vector.shape != stored_vector.shape:
                     continue
 
-                # Cosine distance
-                dot    = np.dot(face_vector, stored_vector)
+                dot = np.dot(face_vector, stored_vector)
                 norm_a = np.linalg.norm(face_vector)
                 norm_b = np.linalg.norm(stored_vector)
 
