@@ -22,6 +22,68 @@ FACE_MODEL      = os.getenv("FACE_MODEL",           "Facenet")
 FACE_DETECTOR   = os.getenv("FACE_DETECTOR",         "ssd")        # better than opencv
 DISTANCE_METRIC = os.getenv("FACE_DISTANCE_METRIC",  "cosine")
 THRESHOLD       = float(os.getenv("FACE_THRESHOLD",  "0.22"))      # strict for attendance
+MAX_DIMENSION   = int(os.getenv("FACE_MAX_DIMENSION", "1024"))     # cap image size before processing
+
+
+def _correct_lighting(img: np.ndarray) -> np.ndarray:
+    """
+    Normalize uneven/poor lighting using CLAHE on the L-channel in LAB space.
+    This helps the detector and embedding model handle dim, backlit, or
+    unevenly lit photos (common with phone cameras in classrooms) without
+    over-brightening well-lit images.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    l_channel = clahe.apply(l_channel)
+
+    lab = cv2.merge((l_channel, a_channel, b_channel))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _resize_if_needed(img: np.ndarray, max_dim: int = MAX_DIMENSION) -> np.ndarray:
+    """
+    Downscale large images before running detection/embedding.
+    Keeps memory and processing time bounded on a resource-constrained
+    instance, and has no meaningful effect on recognition accuracy since
+    DeepFace's models operate on much smaller crops internally anyway.
+    """
+    h, w = img.shape[:2]
+    longest_side = max(h, w)
+    if longest_side <= max_dim:
+        return img
+
+    scale = max_dim / float(longest_side)
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def preprocess_and_save_temp_image(image_bytes: bytes, suffix: str = ".jpg") -> str:
+    """
+    Decode image bytes, correct lighting, resize if oversized, and write
+    the processed result to a temp file for DeepFace to consume.
+    Falls back to the raw, unprocessed image if decoding fails for any
+    reason (e.g. an unusual format cv2 can't parse) so a preprocessing
+    bug never blocks a request that would otherwise have worked.
+    """
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    tmp.close()
+
+    if img is None:
+        # Could not decode — fall back to writing raw bytes as-is
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        return tmp_path
+
+    img = _resize_if_needed(img)
+    img = _correct_lighting(img)
+    cv2.imwrite(tmp_path, img)
+    return tmp_path
 
 
 def save_temp_image(image_bytes: bytes, suffix: str = ".jpg") -> str:
@@ -57,7 +119,7 @@ def generate_face_encoding(image_bytes: bytes) -> List[float]:
     STRICT — rejects image if no clear face is found.
     This prevents storing garbage embeddings that would later match anything.
     """
-    tmp_path = save_temp_image(image_bytes)
+    tmp_path = preprocess_and_save_temp_image(image_bytes)
     try:
         # enforce_detection=True during registration:
         # if no face found we raise an error rather than storing a useless embedding
@@ -110,7 +172,7 @@ def verify_single_face(
     Compare selfie against stored embedding.
     Returns matched, distance, threshold — or an error message.
     """
-    tmp_path = save_temp_image(selfie_bytes)
+    tmp_path = preprocess_and_save_temp_image(selfie_bytes)
     try:
         # Also strict for verification — if selfie has no detectable face, reject it.
         # This is what prevents "any photo" from passing: without a real face
@@ -203,7 +265,7 @@ def recognize_faces_in_class_photo(
     students_with_encodings: List[Dict]
 ) -> Tuple[List[str], int, int]:
     """Recognize multiple students in a class photo."""
-    tmp_path = save_temp_image(image_bytes)
+    tmp_path = preprocess_and_save_temp_image(image_bytes)
     recognized_ids: List[str] = []
 
     try:
